@@ -1,0 +1,13 @@
+# Core scientific stack
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+
+# Map rendering
+folium>=0.14
+
+# Image encoding (usually pre-installed with matplotlib)
+Pillow>=9.0
+
+# Optional: for loading real OSM city graphs
+# osmnx>=1.6
