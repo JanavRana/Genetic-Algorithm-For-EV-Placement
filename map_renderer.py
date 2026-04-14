@@ -1,303 +1,264 @@
 """
 map_renderer.py
 ---------------
-Renders the population density surface as a smooth ImageOverlay
-on a folium map. Also handles GA charging station markers.
+All folium / matplotlib map-rendering logic lives here.
 
-Usage
------
-    from map_renderer import EVChargingMapRenderer
-    renderer = EVChargingMapRenderer(bbox, city_name="Surat, India")
-    renderer.add_density_layer(density_generator)
-    renderer.add_charging_stations(stations)   # Optional: GA output
-    renderer.save("output_map.html")
+Key design decisions
+  • Population density is rendered as a smooth continuous PNG overlay
+    (NOT folium HeatMap which creates ugly circular blobs).
+  • The PNG is generated with matplotlib using a perceptually uniform
+    colormap, alpha-composited so the base OSM tiles show through.
+  • EV station markers use a ⚡ emoji DivIcon so they stand out clearly.
 """
+
+from __future__ import annotations
 
 import io
 import base64
+from typing import List, Dict, Any
+
 import numpy as np
-import folium
-from folium import plugins
-from typing import List, Tuple, Optional
+import matplotlib
+matplotlib.use("Agg")                   # headless – no display needed
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.colors import LinearSegmentedColormap
-
-from population_density import PopulationDensityGenerator, DensityConfig
+import matplotlib.colors as mcolors
+import folium
+from folium.raster_layers import ImageOverlay
 
 
 # ---------------------------------------------------------------------------
-# Custom colormaps (more realistic than stock YlOrRd)
+# Constants
 # ---------------------------------------------------------------------------
 
-def make_urban_colormap():
+# Colourmap for the density overlay
+_DENSITY_CMAP = "YlOrRd"          # yellow → orange → red (population heat)
+_OVERLAY_OPACITY = 0.55            # transparency of the density layer
+_MAP_ZOOM = 12
+
+
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
+
+def density_to_png_base64(density: np.ndarray) -> str:
     """
-    A custom colormap that mimics real urban density maps:
-    low density → soft blue-green → yellow → orange-red → deep red.
+    Convert a (H, W) float density matrix to a transparent PNG encoded as
+    a base64 string suitable for embedding in a folium ImageOverlay.
+
+    Steps
+    -----
+    1. Map density values → RGBA using the chosen colourmap
+    2. Set alpha channel proportional to density (transparent where unpopulated)
+    3. Save to an in-memory BytesIO buffer as PNG
+    4. Encode as base64
     """
-    colors = [
-        (0.05, 0.25, 0.50, 0),    # deep blue, fully transparent
-        (0.13, 0.50, 0.70, 0.3),  # teal
-        (0.56, 0.82, 0.31, 0.5),  # lime-green
-        (1.00, 0.90, 0.20, 0.65), # yellow
-        (1.00, 0.55, 0.10, 0.75), # orange
-        (0.85, 0.10, 0.10, 0.80), # red
-        (0.45, 0.00, 0.20, 0.85), # deep maroon
-    ]
-    positions = [0, 0.15, 0.35, 0.55, 0.72, 0.88, 1.0]
-    cmap = LinearSegmentedColormap.from_list(
-        "urban_density",
-        list(zip(positions, [(r, g, b) for r, g, b, _ in colors])),
-        N=512,
-    )
-    return cmap, [a for _, _, _, a in colors], positions
+    # --- normalise just in case ---
+    d = density.astype(np.float64)
+    d = (d - d.min()) / (d.max() - d.min() + 1e-9)
+
+    # --- apply colourmap to get RGBA (values in [0,1]) ---
+    cmap = plt.get_cmap(_DENSITY_CMAP)
+    rgba = cmap(d)                       # shape (H, W, 4)
+
+    # --- custom alpha: transparent at zero, opaque at 1 ---
+    # Use a non-linear alpha so mid-density areas are still visible
+    rgba[..., 3] = np.clip(d ** 0.6 * _OVERLAY_OPACITY, 0.0, _OVERLAY_OPACITY)
+
+    # --- save to PNG in memory ---
+    fig, ax = plt.subplots(figsize=(density.shape[1] / 100, density.shape[0] / 100), dpi=100)
+    ax.imshow(rgba, origin="upper", aspect="auto", interpolation="bilinear")
+    ax.axis("off")
+    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0, transparent=True)
+    plt.close(fig)
+    buf.seek(0)
+
+    b64 = base64.b64encode(buf.read()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
 
 
-# ---------------------------------------------------------------------------
-# Main renderer class
-# ---------------------------------------------------------------------------
-
-class EVChargingMapRenderer:
+def build_map(
+    bbox:          tuple[float, float, float, float],
+    density:       np.ndarray,
+    ga_stations:   List[Dict[str, Any]],
+    rand_stations: List[Dict[str, Any]] | None = None,
+) -> folium.Map:
     """
-    Orchestrates the full map: basemap → density overlay → GA stations.
+    Build and return the complete folium Map object.
 
     Parameters
     ----------
-    bbox      : (south, west, north, east) bounding box
-    city_name : String label for the map title
-    zoom      : Initial folium zoom level
+    bbox          : (south, north, west, east)
+    density       : 2-D population density array
+    ga_stations   : list of station dicts from ga_integration
+    rand_stations : optional baseline random stations to compare
+
+    Returns
+    -------
+    folium.Map ready to be saved as HTML
     """
+    south, north, west, east = bbox
+    centre_lat = (south + north) / 2
+    centre_lon = (west  + east)  / 2
 
-    def __init__(
-        self,
-        bbox: Tuple[float, float, float, float],
-        city_name: str = "City",
-        zoom: int = 12,
-    ):
-        self.south, self.west, self.north, self.east = bbox
-        self.city_name = city_name
-        self.center_lat = (self.south + self.north) / 2
-        self.center_lon = (self.west  + self.east)  / 2
+    # ------------------------------------------------------------------ #
+    # 1. Base map
+    # ------------------------------------------------------------------ #
+    m = folium.Map(
+        location=[centre_lat, centre_lon],
+        zoom_start=_MAP_ZOOM,
+        tiles="CartoDB positron",
+        prefer_canvas=True,
+    )
 
-        self.map = folium.Map(
-            location=[self.center_lat, self.center_lon],
-            zoom_start=zoom,
-            tiles="CartoDB positron",   # clean light basemap
-            control_scale=True,
+    # ------------------------------------------------------------------ #
+    # 2. Population density overlay
+    # ------------------------------------------------------------------ #
+    png_b64 = density_to_png_base64(density)
+
+    ImageOverlay(
+        image=png_b64,
+        bounds=[[south, west], [north, east]],
+        opacity=1.0,          # alpha already baked into the PNG
+        name="Population Density",
+        interactive=False,
+        cross_origin=False,
+        zindex=1,
+    ).add_to(m)
+
+    # ------------------------------------------------------------------ #
+    # 3. Optional: random-placement baseline (grey markers)
+    # ------------------------------------------------------------------ #
+    if rand_stations:
+        rand_group = folium.FeatureGroup(name="Random Placement (baseline)", show=True)
+        for st in rand_stations:
+            _add_station_marker(
+                group=rand_group,
+                lat=st["lat"],
+                lon=st["lon"],
+                label=f"Random {st['id']}",
+                emoji="📍",
+                color="#888888",
+            )
+        rand_group.add_to(m)
+
+    # ------------------------------------------------------------------ #
+    # 4. GA-optimised stations (⚡ markers)
+    # ------------------------------------------------------------------ #
+    ga_group = folium.FeatureGroup(name="GA-Optimised EV Stations", show=True)
+    for st in ga_stations:
+        _add_station_marker(
+            group=ga_group,
+            lat=st["lat"],
+            lon=st["lon"],
+            label=st["label"],
+            emoji="⚡",
+            color="#00cc44",
         )
-        self._add_layer_control_placeholder()
+    ga_group.add_to(m)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # 5. Layer control + title
+    # ------------------------------------------------------------------ #
+    folium.LayerControl(collapsed=False).add_to(m)
+    _add_title(m, n_stations=len(ga_stations))
+    _add_legend(m)
 
-    def add_density_layer(
-        self,
-        generator: PopulationDensityGenerator,
-        colormap: str = "custom",
-        alpha_max: float = 0.72,
-        layer_name: str = "Population Density",
-    ) -> "EVChargingMapRenderer":
-        """
-        Generate the density surface and add it as an ImageOverlay.
+    return m
 
-        Parameters
-        ----------
-        generator  : Configured PopulationDensityGenerator instance
-        colormap   : "custom" uses the urban colormap; any matplotlib name works
-        alpha_max  : Max overlay opacity
-        layer_name : Name shown in the LayerControl
-        """
-        density = generator.generate()
 
-        if colormap == "custom":
-            rgba = self._apply_custom_colormap(density, alpha_max)
-        else:
-            rgba = generator.to_rgba(density, colormap_name=colormap, alpha_max=alpha_max)
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-        # Encode as PNG in memory (no temp file needed)
-        png_b64 = self._array_to_b64_png(rgba)
-
-        bounds = [[self.south, self.west], [self.north, self.east]]
-        folium.raster_layers.ImageOverlay(
-            image=f"data:image/png;base64,{png_b64}",
-            bounds=bounds,
-            opacity=1.0,          # alpha baked into RGBA; keep folium opacity at 1
-            name=layer_name,
-            zindex=1,
-            interactive=False,
-        ).add_to(self.map)
-
-        # Store for legend
-        self._density_added = True
-        return self
-
-    def add_charging_stations(
-        self,
-        stations: List[Tuple[float, float]],
-        scores: Optional[List[float]] = None,
-        layer_name: str = "EV Charging Stations (GA)",
-    ) -> "EVChargingMapRenderer":
-        """
-        Plot GA-selected charging station locations.
-
-        Parameters
-        ----------
-        stations : List of (lat, lon) tuples from the GA output
-        scores   : Optional fitness scores per station (used to size markers)
-        layer_name : LayerControl label
-        """
-        fg = folium.FeatureGroup(name=layer_name, show=True)
-
-        if scores is None:
-            scores = [1.0] * len(stations)
-
-        max_score = max(scores) if scores else 1.0
-
-        for i, ((lat, lon), score) in enumerate(zip(stations, scores)):
-            normalized = score / max_score if max_score else 1.0
-            radius = 8 + 10 * normalized
-
-            folium.CircleMarker(
-                location=[lat, lon],
-                radius=radius,
-                color="#00FF88",
-                fill=True,
-                fill_color="#00DD77",
-                fill_opacity=0.85,
-                weight=2.5,
-                popup=folium.Popup(
-                    f"<b>Station #{i+1}</b><br>"
-                    f"Lat: {lat:.5f}<br>Lon: {lon:.5f}<br>"
-                    f"Score: {score:.3f}",
-                    max_width=200,
-                ),
-                tooltip=f"⚡ Station #{i+1}",
-            ).add_to(fg)
-
-            # Inner dot for visibility
-            folium.CircleMarker(
-                location=[lat, lon],
-                radius=3,
-                color="#FFFFFF",
-                fill=True,
-                fill_color="#FFFFFF",
-                fill_opacity=1.0,
-                weight=0,
-            ).add_to(fg)
-
-        fg.add_to(self.map)
-        return self
-
-    def add_title(self, title: Optional[str] = None) -> "EVChargingMapRenderer":
-        """Inject a floating title card into the map HTML."""
-        title = title or f"EV Charging Optimization — {self.city_name}"
-        html = f"""
-        <div style="
-            position: fixed;
-            top: 14px; left: 50%; transform: translateX(-50%);
-            z-index: 9999;
-            background: rgba(15,15,30,0.88);
-            color: #F0F4FF;
-            padding: 10px 22px;
-            border-radius: 8px;
-            font-family: 'Segoe UI', sans-serif;
-            font-size: 15px;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-            border: 1px solid rgba(100,180,255,0.25);
-            pointer-events: none;
-        ">
-            ⚡ {title}
-        </div>
-        """
-        self.map.get_root().html.add_child(folium.Element(html))
-        return self
-
-    def add_legend(self) -> "EVChargingMapRenderer":
-        """Add a density legend + station key."""
-        html = """
-        <div style="
-            position: fixed; bottom: 40px; right: 14px; z-index: 9998;
-            background: rgba(15,15,30,0.88); color: #E8EDF5;
-            padding: 14px 16px; border-radius: 8px; font-size: 12px;
-            font-family: 'Segoe UI', sans-serif;
-            box-shadow: 0 4px 16px rgba(0,0,0,0.5);
-            border: 1px solid rgba(100,180,255,0.2);
-            min-width: 155px;
-        ">
-            <div style="font-weight:700; font-size:13px; margin-bottom:8px;
-                        border-bottom:1px solid rgba(255,255,255,0.15); padding-bottom:6px;">
-                Legend
+def _add_station_marker(
+    group:  folium.FeatureGroup,
+    lat:    float,
+    lon:    float,
+    label:  str,
+    emoji:  str,
+    color:  str,
+) -> None:
+    """Add a styled DivIcon marker to a FeatureGroup."""
+    icon_html = f"""
+    <div style="
+        font-size: 22px;
+        line-height: 1;
+        text-align: center;
+        text-shadow: 0 0 6px {color}, 0 0 12px {color};
+        filter: drop-shadow(0 2px 4px rgba(0,0,0,0.5));
+    ">{emoji}</div>
+    """
+    folium.Marker(
+        location=[lat, lon],
+        icon=folium.DivIcon(
+            html=icon_html,
+            icon_size=(28, 28),
+            icon_anchor=(14, 14),
+        ),
+        popup=folium.Popup(
+            f"""
+            <div style="font-family:sans-serif; font-size:13px; padding:4px;">
+              <b style="color:{color};">{emoji} {label}</b><br>
+              <span style="color:#555;">Lat: {lat:.5f}</span><br>
+              <span style="color:#555;">Lon: {lon:.5f}</span>
             </div>
-            <div style="font-weight:600; margin-bottom:6px;">Population Density</div>
-            <div style="
-                width: 130px; height: 14px; border-radius: 3px;
-                background: linear-gradient(to right,
-                    rgba(34,128,178,0.4),
-                    rgba(143,209,79,0.6),
-                    rgba(255,230,51,0.75),
-                    rgba(255,140,26,0.8),
-                    rgba(216,26,26,0.85),
-                    rgba(115,0,51,0.9));
-                margin-bottom: 3px;
-            "></div>
-            <div style="display:flex; justify-content:space-between;
-                        font-size:10px; color:#AAB4C8; margin-bottom:10px;">
-                <span>Low</span><span>High</span>
-            </div>
-            <div style="font-weight:600; margin-bottom:5px;">GA Stations</div>
-            <div style="display:flex; align-items:center; gap:7px;">
-                <div style="width:14px; height:14px; border-radius:50%;
-                            background:#00DD77; border:2px solid #00FF88;"></div>
-                <span>Selected location</span>
-            </div>
-        </div>
-        """
-        self.map.get_root().html.add_child(folium.Element(html))
-        return self
+            """,
+            max_width=200,
+        ),
+        tooltip=label,
+    ).add_to(group)
 
-    def finalize(self) -> "EVChargingMapRenderer":
-        """Add LayerControl. Call after all layers are added."""
-        folium.LayerControl(position="topright", collapsed=False).add_to(self.map)
-        return self
 
-    def save(self, path: str) -> str:
-        """Save the map to an HTML file and return the path."""
-        self.map.save(path)
-        print(f"[✓] Map saved → {path}")
-        return path
+def _add_title(m: folium.Map, n_stations: int) -> None:
+    """Inject a floating title card into the map HTML."""
+    title_html = f"""
+    <div style="
+        position: fixed;
+        top: 16px; left: 50%; transform: translateX(-50%);
+        z-index: 1000;
+        background: rgba(10,10,20,0.88);
+        color: #00ffaa;
+        font-family: 'Segoe UI', Arial, sans-serif;
+        font-size: 15px;
+        font-weight: 700;
+        padding: 10px 22px;
+        border-radius: 30px;
+        border: 1.5px solid #00cc66;
+        box-shadow: 0 4px 20px rgba(0,200,100,0.25);
+        letter-spacing: 0.5px;
+        pointer-events: none;
+        white-space: nowrap;
+    ">
+      ⚡ Optimal EV Charging Station Placement — {n_stations} Stations (Surat, India)
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(title_html))
 
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
 
-    def _apply_custom_colormap(
-        self, density: np.ndarray, alpha_max: float
-    ) -> np.ndarray:
-        """Use the urban density colormap with blended alpha."""
-        from scipy.ndimage import gaussian_filter
-
-        cmap, _, _ = make_urban_colormap()
-        rgba = cmap(density).astype(np.float32)           # (H, W, 4) in [0,1]
-
-        # Custom alpha: sigmoid-shaped, smoothed to avoid rings
-        alpha_raw = np.where(density < 0.04, 0.0, (density ** 0.6) * alpha_max)
-        alpha_smooth = gaussian_filter(alpha_raw, sigma=10)
-        rgba[:, :, 3] = np.clip(alpha_smooth, 0, alpha_max)
-
-        rgba = np.flipud(rgba)                             # north at top
-        return (rgba * 255).astype(np.uint8)
-
-    @staticmethod
-    def _array_to_b64_png(rgba: np.ndarray) -> str:
-        """Encode RGBA uint8 array as base64 PNG string."""
-        from PIL import Image
-        buf = io.BytesIO()
-        Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG", optimize=False)
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    def _add_layer_control_placeholder(self):
-        """Dummy FeatureGroup so LayerControl always has ≥1 entry."""
-        folium.FeatureGroup(name="Basemap", show=True).add_to(self.map)
+def _add_legend(m: folium.Map) -> None:
+    """Add a small legend explaining the map layers."""
+    legend_html = """
+    <div style="
+        position: fixed;
+        bottom: 40px; right: 16px;
+        z-index: 1000;
+        background: rgba(10,10,20,0.88);
+        color: #eee;
+        font-family: 'Segoe UI', Arial, sans-serif;
+        font-size: 12px;
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: 1px solid #444;
+        line-height: 1.9;
+        pointer-events: none;
+    ">
+      <b style="color:#00ffaa;">Map Legend</b><br>
+      🟡→🔴&nbsp; Population density (low → high)<br>
+      ⚡&nbsp; GA-optimised EV station<br>
+      📍&nbsp; Random baseline station
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
