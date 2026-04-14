@@ -1,160 +1,104 @@
 """
 ga_integration.py
 -----------------
-Adapter layer: converts your existing Genetic Algorithm output
-into the format expected by EVChargingMapRenderer.
+Bridge between the Genetic Algorithm (grid indices) and the real-world
+map coordinates (latitude / longitude).
 
-This module is intentionally thin — it just bridges your GA's
-coordinate system (grid indices OR lat/lon) to the renderer.
+Responsibilities
+  1. Convert GA chromosome (row, col) → (lat, lon) for each station
+  2. Optionally snap each station to the nearest real road node in the
+     OSMnx graph (improves realism; gracefully skipped if graph is None)
+  3. Return a list of dicts ready to be consumed by map_renderer.py
 """
 
+from __future__ import annotations
+
 import numpy as np
-from typing import List, Tuple, Union, Optional
+from typing import List, Dict, Any, Optional
 
-
-class GAOutputAdapter:
-    """
-    Converts GA chromosome output → (lat, lon) pairs for the map renderer.
-
-    Supports two input modes
-    -----------------------
-    A) Grid-index mode : GA returns (row, col) grid indices.
-       You provide the bounding box and grid shape, and the adapter
-       maps indices to geographic coordinates via linear interpolation.
-
-    B) Coordinate mode : GA returns (lat, lon) directly (no conversion needed).
-    """
-
-    def __init__(
-        self,
-        bbox: Tuple[float, float, float, float],
-        grid_shape: Optional[Tuple[int, int]] = None,
-    ):
-        """
-        Parameters
-        ----------
-        bbox       : (south, west, north, east) — same bbox used in your osmnx load
-        grid_shape : (n_rows, n_cols) of your GA grid. Required only for grid-index mode.
-        """
-        self.south, self.west, self.north, self.east = bbox
-        self.grid_shape = grid_shape
-
-    def from_grid_indices(
-        self,
-        indices: List[Tuple[int, int]],
-        fitness_scores: Optional[List[float]] = None,
-    ) -> Tuple[List[Tuple[float, float]], List[float]]:
-        """
-        Convert (row, col) grid indices → (lat, lon) pairs.
-
-        Parameters
-        ----------
-        indices       : List of (row, col) tuples from GA chromosome
-        fitness_scores: Optional per-station fitness values
-
-        Returns
-        -------
-        stations : List of (lat, lon) tuples
-        scores   : Normalised fitness scores (0–1), or uniform if not provided
-        """
-        if self.grid_shape is None:
-            raise ValueError("grid_shape must be set for grid-index mode.")
-
-        n_rows, n_cols = self.grid_shape
-        stations = []
-
-        for row, col in indices:
-            lat = self.south + (row / (n_rows - 1)) * (self.north - self.south)
-            lon = self.west  + (col / (n_cols - 1)) * (self.east  - self.west)
-            stations.append((lat, lon))
-
-        scores = self._normalize_scores(fitness_scores, len(stations))
-        return stations, scores
-
-    def from_latlon(
-        self,
-        latlon_pairs: List[Tuple[float, float]],
-        fitness_scores: Optional[List[float]] = None,
-    ) -> Tuple[List[Tuple[float, float]], List[float]]:
-        """
-        Pass-through for GA output already in lat/lon.
-
-        Parameters
-        ----------
-        latlon_pairs  : List of (lat, lon) tuples
-        fitness_scores: Optional fitness values
-
-        Returns
-        -------
-        stations, scores
-        """
-        scores = self._normalize_scores(fitness_scores, len(latlon_pairs))
-        return list(latlon_pairs), scores
-
-    def top_k(
-        self,
-        stations: List[Tuple[float, float]],
-        scores: List[float],
-        k: int,
-    ) -> Tuple[List[Tuple[float, float]], List[float]]:
-        """Return the top-k stations by fitness score."""
-        paired = sorted(zip(scores, stations), reverse=True)[:k]
-        top_scores, top_stations = zip(*paired)
-        return list(top_stations), list(top_scores)
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _normalize_scores(scores: Optional[List[float]], n: int) -> List[float]:
-        if scores is None:
-            return [1.0] * n
-        arr = np.array(scores, dtype=float)
-        rng = arr.max() - arr.min()
-        if rng == 0:
-            return [1.0] * n
-        return ((arr - arr.min()) / rng).tolist()
+from population_density import density_to_latlon
+from genetic_algorithm import Chromosome
 
 
 # ---------------------------------------------------------------------------
-# Example: wiring GA output into the map (copy-paste into your GA script)
+# Public API
 # ---------------------------------------------------------------------------
 
-def render_ga_result(
-    ga_grid_solutions: List[Tuple[int, int]],
-    ga_fitness_scores: List[float],
-    bbox: Tuple[float, float, float, float],
-    grid_shape: Tuple[int, int],
-    output_html: str = "surat_ev_map.html",
-):
+def chromosome_to_stations(
+    chromosome: Chromosome,
+    bbox:       tuple[float, float, float, float],
+    grid_size:  int,
+    graph=None,           # optional osmnx graph for road-snapping
+) -> List[Dict[str, Any]]:
     """
-    One-shot convenience function: takes raw GA output, renders full map.
+    Convert a GA chromosome to a list of station dicts.
 
     Parameters
     ----------
-    ga_grid_solutions : list of (row, col) chosen by your GA
-    ga_fitness_scores : corresponding fitness values
-    bbox              : (south, west, north, east)
-    grid_shape        : (n_rows, n_cols) of your GA grid
-    output_html       : output filename
+    chromosome : list of (row, col) tuples
+    bbox       : (south, north, west, east)
+    grid_size  : size of the density grid
+    graph      : osmnx graph (optional); if provided, each station is
+                 snapped to the nearest road intersection
+
+    Returns
+    -------
+    list of dicts, each with keys:
+        id    : int   (1-based)
+        lat   : float
+        lon   : float
+        label : str
     """
-    from population_density import PopulationDensityGenerator, PopulationCenter, DensityConfig
-    from map_renderer import EVChargingMapRenderer
-    from main import SURAT_CENTERS, DENSITY_CONFIG  # reuse Surat config
+    stations = []
 
-    adapter = GAOutputAdapter(bbox=bbox, grid_shape=grid_shape)
-    stations, scores = adapter.from_grid_indices(ga_grid_solutions, ga_fitness_scores)
+    for idx, (row, col) in enumerate(chromosome, start=1):
+        lat, lon = density_to_latlon(row, col, bbox, grid_size)
 
-    generator = PopulationDensityGenerator(
-        bbox=bbox, centers=SURAT_CENTERS, config=DENSITY_CONFIG
-    )
+        # --- optional road-snapping ---
+        if graph is not None:
+            lat, lon = _snap_to_road(graph, lat, lon)
 
-    renderer = EVChargingMapRenderer(bbox=bbox, city_name="Surat, Gujarat", zoom=13)
-    (
-        renderer
-        .add_density_layer(generator)
-        .add_charging_stations(stations, scores=scores)
-        .add_title("EV Charging Optimization — GA Result")
-        .add_legend()
-        .finalize()
-        .save(output_html)
-    )
+        stations.append({
+            "id":    idx,
+            "lat":   lat,
+            "lon":   lon,
+            "label": f"EV Station {idx}",
+        })
+
+    return stations
+
+
+def random_stations(
+    n_stations: int,
+    bbox:       tuple[float, float, float, float],
+    grid_size:  int,
+    seed:       int | None = None,
+    graph=None,
+) -> List[Dict[str, Any]]:
+    """
+    Generate `n_stations` random placements (used as baseline comparison).
+    Same signature as chromosome_to_stations so results are comparable.
+    """
+    rng = np.random.default_rng(seed)
+    rows = rng.integers(0, grid_size, size=n_stations)
+    cols = rng.integers(0, grid_size, size=n_stations)
+    dummy_chromosome: Chromosome = list(zip(rows.tolist(), cols.tolist()))
+    return chromosome_to_stations(dummy_chromosome, bbox, grid_size, graph)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _snap_to_road(graph, lat: float, lon: float) -> tuple[float, float]:
+    """
+    Snap a coordinate to the nearest node in the OSMnx graph.
+    Returns the original coordinate if snapping fails for any reason.
+    """
+    try:
+        import osmnx as ox
+        node_id = ox.distance.nearest_nodes(graph, lon, lat)
+        node    = graph.nodes[node_id]
+        return float(node["y"]), float(node["x"])
+    except Exception:
+        return lat, lon
