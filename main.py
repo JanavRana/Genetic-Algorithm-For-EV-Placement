@@ -1,112 +1,172 @@
 """
 main.py
 -------
-Entry point: configure Surat's population centers, run the density
-generator, and render the final folium map with optional GA stations.
+Entry point — orchestrates the full EV charging station optimisation pipeline.
 
-Run
----
-    python main.py
-
-Output
-------
-    surat_ev_map.html   — Open in any browser
+Pipeline
+  1. Ask user for number of stations
+  2. Download Surat road network via osmnx (defines bounding box)
+  3. Generate synthetic population density
+  4. Run Genetic Algorithm
+  5. Convert GA result to lat/lon stations (road-snapped)
+  6. Build folium map with density overlay + markers
+  7. Save HTML and open in browser
 """
 
-from population_density import PopulationDensityGenerator, PopulationCenter, DensityConfig
-from map_renderer import EVChargingMapRenderer
+import sys
+import webbrowser
+from pathlib import Path
+import time
 
-# ---------------------------------------------------------------------------
-# 1. Geographic bounding box for Surat, Gujarat, India
-# ---------------------------------------------------------------------------
-#    Roughly covers the urban agglomeration + surroundings
-SURAT_BBOX = (21.08, 72.74, 21.28, 72.95)   # (south, west, north, east)
+# ── project modules ────────────────────────────────────────────────────────
+from population_density import generate_density_matrix
+from genetic_algorithm   import GAConfig, run_genetic_algorithm
+from ga_integration      import chromosome_to_stations, random_stations
+from map_renderer        import build_map
 
-# ---------------------------------------------------------------------------
-# 2. Population centers (multi-hotspot model)
-#    Based on Surat's real urban geography:
-#    - Old city core around Rander Rd / Chowk Bazar area
-#    - Adajan & Vesu (western high-density residential)
-#    - Udhna & Sagrampura (industrial + working class)
-#    - Katargam (dense north)
-#    - Varachha (dense east)
-#    - Dindoli & Althan (south growth corridors)
-# ---------------------------------------------------------------------------
-SURAT_CENTERS = [
-    # (lat,    lon,    weight, spread_lat, spread_lon)  # area name
-    PopulationCenter(21.195, 72.831, weight=1.00, spread_lat=0.018, spread_lon=0.020),  # City Core / Chowk
-    PopulationCenter(21.180, 72.790, weight=0.85, spread_lat=0.016, spread_lon=0.018),  # Adajan
-    PopulationCenter(21.162, 72.812, weight=0.75, spread_lat=0.014, spread_lon=0.015),  # Vesu
-    PopulationCenter(21.210, 72.858, weight=0.90, spread_lat=0.017, spread_lon=0.019),  # Varachha
-    PopulationCenter(21.228, 72.840, weight=0.70, spread_lat=0.013, spread_lon=0.016),  # Katargam
-    PopulationCenter(21.175, 72.855, weight=0.80, spread_lat=0.015, spread_lon=0.017),  # Udhna
-    PopulationCenter(21.155, 72.840, weight=0.60, spread_lat=0.012, spread_lon=0.014),  # Dindoli
-    PopulationCenter(21.200, 72.810, weight=0.65, spread_lat=0.013, spread_lon=0.015),  # Sagrampura
-    PopulationCenter(21.240, 72.870, weight=0.50, spread_lat=0.011, spread_lon=0.013),  # Limbayat
-    PopulationCenter(21.135, 72.800, weight=0.45, spread_lat=0.010, spread_lon=0.012),  # Althan
-    PopulationCenter(21.190, 72.875, weight=0.55, spread_lat=0.012, spread_lon=0.014),  # Kapodra
-]
 
-# ---------------------------------------------------------------------------
-# 3. Density generation config
-#    sigma_smooth=18 is the key parameter that kills circular artifacts
-# ---------------------------------------------------------------------------
-DENSITY_CONFIG = DensityConfig(
-    grid_resolution=500,    # Higher = sharper PNG, more memory
-    sigma_smooth=18.0,      # Main smoothing — increase to blend more
-    noise_scale=0.09,       # Organic texture intensity
-    noise_seed=7,
-)
+# ── constants ──────────────────────────────────────────────────────────────
+CITY            = "Surat, India"
+NETWORK_DIST_M  = 7_000          # radius in metres (keeps download fast)
+GRID_SIZE       = 200            # density grid resolution
+OUTPUT_FILE     = "ev_charging_map.html"
 
-# ---------------------------------------------------------------------------
-# 4. (Optional) Plug in your GA output here
-#    Replace with actual output from your Genetic Algorithm
-# ---------------------------------------------------------------------------
-EXAMPLE_GA_STATIONS = [
-    # (lat,    lon)     — locations selected by GA
-    (21.195, 72.831),   # City core
-    (21.180, 72.790),   # Adajan junction
-    (21.210, 72.858),   # Varachha road
-    (21.228, 72.840),   # Katargam
-    (21.162, 72.812),   # Vesu
-    (21.175, 72.855),   # Udhna
-    (21.240, 72.870),   # Limbayat
-]
 
-EXAMPLE_GA_SCORES = [0.94, 0.88, 0.91, 0.76, 0.72, 0.81, 0.68]
+# ── helpers ────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# 5. Build and save the map
-# ---------------------------------------------------------------------------
+def get_n_stations() -> int:
+    """Prompt user for the desired number of EV charging stations."""
+    while True:
+        raw = input("\n⚡  How many EV charging stations do you want? (e.g. 10): ").strip()
+        try:
+            n = int(raw)
+            if 1 <= n <= 100:
+                return n
+            print("   Please enter a number between 1 and 100.")
+        except ValueError:
+            print("   Invalid input — please enter a whole number.")
 
-def main(output_path: str = "surat_ev_map.html"):
-    print("[1/4] Initialising population density generator …")
-    generator = PopulationDensityGenerator(
-        bbox=SURAT_BBOX,
-        centers=SURAT_CENTERS,
-        config=DENSITY_CONFIG,
+
+def download_city_graph(city: str, dist: int):
+    """
+    Download the drivable road network for the city within `dist` metres.
+    Returns (graph, bbox) where bbox = (south, north, west, east).
+    """
+    import osmnx as ox
+    print(f"\n📡  Downloading road network for '{city}' (radius {dist/1000:.1f} km)…")
+    t0 = time.time()
+    G = ox.graph_from_place(city, network_type="drive", dist=dist)
+    elapsed = time.time() - t0
+    print(f"    ✓ Downloaded in {elapsed:.1f}s  "
+          f"({G.number_of_nodes()} nodes, {G.number_of_edges()} edges)")
+
+    # Derive bounding box from graph node coordinates
+    lats = [d["y"] for _, d in G.nodes(data=True)]
+    lons = [d["x"] for _, d in G.nodes(data=True)]
+    bbox = (min(lats), max(lats), min(lons), max(lons))
+    print(f"    Bounding box: S={bbox[0]:.4f}  N={bbox[1]:.4f}  "
+          f"W={bbox[2]:.4f}  E={bbox[3]:.4f}")
+    return G, bbox
+
+
+# ── main ───────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    print("=" * 60)
+    print("  ⚡  EV Charging Station Optimiser  —  Genetic Algorithm")
+    print("=" * 60)
+
+    # ── 1. User input ──────────────────────────────────────────────────────
+    n_stations = get_n_stations()
+    print(f"\n  Will optimise placement of {n_stations} EV charging station(s).")
+
+    # ── 2. Download city graph ─────────────────────────────────────────────
+    try:
+        graph, bbox = download_city_graph(CITY, NETWORK_DIST_M)
+    except Exception as e:
+        print(f"\n⚠️  Could not download graph: {e}")
+        print("   Falling back to a hard-coded bounding box for Surat.")
+        graph = None
+        # Approximate bbox for central Surat
+        bbox = (21.184, 21.244, 72.788, 72.848)
+
+    # ── 3. Population density ──────────────────────────────────────────────
+    print("\n🌆  Generating synthetic population density…", end=" ", flush=True)
+    density = generate_density_matrix(
+        bbox=bbox,
+        grid_size=GRID_SIZE,
+        n_hotspots=20,
+        seed=None,          # fully random each run  ← BONUS: different each time
+    )
+    print("done ✓")
+
+    # ── 4. Genetic Algorithm ───────────────────────────────────────────────
+    config = GAConfig(
+        n_stations      = n_stations,
+        population_size = 50,
+        n_generations   = 100,
+        mutation_rate   = 0.15,
+        elite_fraction  = 0.10,
+        coverage_scale  = 15.0,
+        seed            = None,    # random each run
     )
 
-    print("[2/4] Setting up folium map renderer …")
-    renderer = EVChargingMapRenderer(
-        bbox=SURAT_BBOX,
-        city_name="Surat, Gujarat",
-        zoom=13,
+    print(f"\n🧬  Running Genetic Algorithm "
+          f"(pop={config.population_size}, gen={config.n_generations})…\n")
+    t0     = time.time()
+    result = run_genetic_algorithm(density, config, verbose=True)
+    elapsed = time.time() - t0
+
+    print(f"\n  ✓ GA finished in {elapsed:.1f}s  |  "
+          f"Best fitness: {result.best_fitness:.4f}")
+
+    # ── 5. Convert chromosome to station coordinates ───────────────────────
+    print("\n📍  Mapping stations to coordinates…", end=" ", flush=True)
+    ga_stations = chromosome_to_stations(
+        chromosome=result.best_chromosome,
+        bbox=bbox,
+        grid_size=GRID_SIZE,
+        graph=graph,
     )
 
-    print("[3/4] Generating density surface + encoding PNG overlay …")
-    (
-        renderer
-        .add_density_layer(generator, colormap="custom", alpha_max=0.72)
-        .add_charging_stations(EXAMPLE_GA_STATIONS, scores=EXAMPLE_GA_SCORES)
-        .add_title()
-        .add_legend()
-        .finalize()
+    # Baseline: same number of random stations for visual comparison
+    rand_st = random_stations(
+        n_stations=n_stations,
+        bbox=bbox,
+        grid_size=GRID_SIZE,
+        seed=7,
+        graph=graph,
     )
+    print("done ✓")
 
-    print("[4/4] Saving …")
-    renderer.save(output_path)
-    print(f"\n✅  Done! Open '{output_path}' in your browser.\n")
+    # Print a summary table
+    print("\n  GA-Optimised Station Locations:")
+    print(f"  {'#':<4} {'Latitude':>10}  {'Longitude':>11}")
+    print("  " + "-" * 28)
+    for st in ga_stations:
+        print(f"  {st['id']:<4} {st['lat']:>10.5f}  {st['lon']:>11.5f}")
+
+    # ── 6. Build map ───────────────────────────────────────────────────────
+    print("\n🗺️  Building interactive map…", end=" ", flush=True)
+    m = build_map(
+        bbox=bbox,
+        density=density,
+        ga_stations=ga_stations,
+        rand_stations=rand_st,
+    )
+    print("done ✓")
+
+    # ── 7. Save & open ─────────────────────────────────────────────────────
+    output_path = Path(OUTPUT_FILE).resolve()
+    m.save(str(output_path))
+    print(f"\n💾  Map saved → {output_path}")
+
+    print("🌐  Opening in browser…")
+    webbrowser.open(output_path.as_uri())
+
+    print("\n" + "=" * 60)
+    print("  ✅  Done!  Enjoy your optimised EV charging map.")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
