@@ -1,16 +1,3 @@
-"""
-map_renderer.py
----------------
-All folium / matplotlib map-rendering logic lives here.
-
-Key design decisions
-  • Population density is rendered as a smooth continuous PNG overlay
-    (NOT folium HeatMap which creates ugly circular blobs).
-  • The PNG is generated with matplotlib using a perceptually uniform
-    colormap, alpha-composited so the base OSM tiles show through.
-  • EV station markers use a ⚡ emoji DivIcon so they stand out clearly.
-"""
-
 from __future__ import annotations
 
 import io
@@ -26,9 +13,7 @@ import folium
 from folium.raster_layers import ImageOverlay
 
 
-# ---------------------------------------------------------------------------
 # Constants
-# ---------------------------------------------------------------------------
 
 # Colourmap for the density overlay
 _DENSITY_CMAP = "YlOrRd"          # yellow → orange → red (population heat)
@@ -36,35 +21,34 @@ _OVERLAY_OPACITY = 0.55            # transparency of the density layer
 _MAP_ZOOM = 12
 
 
-# ---------------------------------------------------------------------------
 # Public helpers
-# ---------------------------------------------------------------------------
+"""
+Convert a (H, W) float density matrix to a transparent PNG encoded as
+a base64 string suitable for embedding in a folium ImageOverlay.
+
+Steps
+
+1. Map density values → RGBA using the chosen colourmap
+2. Set alpha channel proportional to density (transparent where unpopulated)
+3. Save to an in-memory BytesIO buffer as PNG
+4. Encode as base64
+"""
 
 def density_to_png_base64(density: np.ndarray) -> str:
-    """
-    Convert a (H, W) float density matrix to a transparent PNG encoded as
-    a base64 string suitable for embedding in a folium ImageOverlay.
 
-    Steps
-    -----
-    1. Map density values → RGBA using the chosen colourmap
-    2. Set alpha channel proportional to density (transparent where unpopulated)
-    3. Save to an in-memory BytesIO buffer as PNG
-    4. Encode as base64
-    """
-    # --- normalise just in case ---
+    #  normalise just in case 
     d = density.astype(np.float64)
     d = (d - d.min()) / (d.max() - d.min() + 1e-9)
 
-    # --- apply colourmap to get RGBA (values in [0,1]) ---
+    #  apply colourmap to get RGBA (values in [0,1]) 
     cmap = plt.get_cmap(_DENSITY_CMAP)
     rgba = cmap(d)                       # shape (H, W, 4)
 
-    # --- custom alpha: transparent at zero, opaque at 1 ---
+    #  custom alpha: transparent at zero, opaque at 1 
     # Use a non-linear alpha so mid-density areas are still visible
     rgba[..., 3] = np.clip(d ** 0.6 * _OVERLAY_OPACITY, 0.0, _OVERLAY_OPACITY)
 
-    # --- save to PNG in memory ---
+    #  save to PNG in memory 
     fig, ax = plt.subplots(figsize=(density.shape[1] / 100, density.shape[0] / 100), dpi=100)
     ax.imshow(rgba, origin="upper", aspect="auto", interpolation="bilinear")
     ax.axis("off")
@@ -78,34 +62,32 @@ def density_to_png_base64(density: np.ndarray) -> str:
     b64 = base64.b64encode(buf.read()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
+"""
+Build and return the complete folium Map object.
 
+Parameters
+
+bbox          : (south, north, west, east)
+density       : 2-D population density array
+ga_stations   : list of station dicts from ga_integration
+rand_stations : optional baseline random stations to compare
+
+Returns
+
+folium.Map ready to be saved as HTML
+"""
 def build_map(
     bbox:          tuple[float, float, float, float],
     density:       np.ndarray,
     ga_stations:   List[Dict[str, Any]],
     rand_stations: List[Dict[str, Any]] | None = None,
 ) -> folium.Map:
-    """
-    Build and return the complete folium Map object.
 
-    Parameters
-    ----------
-    bbox          : (south, north, west, east)
-    density       : 2-D population density array
-    ga_stations   : list of station dicts from ga_integration
-    rand_stations : optional baseline random stations to compare
-
-    Returns
-    -------
-    folium.Map ready to be saved as HTML
-    """
     south, north, west, east = bbox
     centre_lat = (south + north) / 2
     centre_lon = (west  + east)  / 2
 
-    # ------------------------------------------------------------------ #
     # 1. Base map
-    # ------------------------------------------------------------------ #
     m = folium.Map(
         location=[centre_lat, centre_lon],
         zoom_start=_MAP_ZOOM,
@@ -113,9 +95,14 @@ def build_map(
         prefer_canvas=True,
     )
 
-    # ------------------------------------------------------------------ #
+    folium.Rectangle(
+    bounds=[[south, west], [north, east]],
+    color="black",
+    weight=3,
+    fill=False
+    ).add_to(m)
+
     # 2. Population density overlay
-    # ------------------------------------------------------------------ #
     png_b64 = density_to_png_base64(density)
 
     ImageOverlay(
@@ -128,9 +115,7 @@ def build_map(
         zindex=1,
     ).add_to(m)
 
-    # ------------------------------------------------------------------ #
     # 3. Optional: random-placement baseline (grey markers)
-    # ------------------------------------------------------------------ #
     if rand_stations:
         rand_group = folium.FeatureGroup(name="Random Placement (baseline)", show=True)
         for st in rand_stations:
@@ -144,9 +129,7 @@ def build_map(
             )
         rand_group.add_to(m)
 
-    # ------------------------------------------------------------------ #
     # 4. GA-optimised stations (⚡ markers)
-    # ------------------------------------------------------------------ #
     ga_group = folium.FeatureGroup(name="GA-Optimised EV Stations", show=True)
     for st in ga_stations:
         _add_station_marker(
@@ -159,9 +142,7 @@ def build_map(
         )
     ga_group.add_to(m)
 
-    # ------------------------------------------------------------------ #
     # 5. Layer control + title
-    # ------------------------------------------------------------------ #
     folium.LayerControl(collapsed=False).add_to(m)
     _add_title(m, n_stations=len(ga_stations))
     _add_legend(m)
@@ -169,9 +150,7 @@ def build_map(
     return m
 
 
-# ---------------------------------------------------------------------------
 # Internal helpers
-# ---------------------------------------------------------------------------
 
 def _add_station_marker(
     group:  folium.FeatureGroup,

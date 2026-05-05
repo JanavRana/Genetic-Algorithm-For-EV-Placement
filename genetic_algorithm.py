@@ -1,43 +1,14 @@
-"""
-genetic_algorithm.py
---------------------
-Pure-Python / NumPy genetic algorithm for optimal EV-charging-station placement.
-
-Chromosome representation
-  A chromosome is a list of `n_stations` (row, col) integer tuples
-  representing grid indices inside the density matrix.
-
-Fitness function
-  We want stations to be placed where population density is HIGH and
-  where each high-density cell is *covered* by at least one nearby station.
-
-  fitness(chromosome) = Σ_{cell} density[cell] * exp(-d_min(cell) / scale)
-
-  where d_min(cell) is the Euclidean grid distance to the nearest station.
-  Higher fitness ← stations closer to dense cells.
-
-GA operators
-  Selection  : tournament selection (size 3)
-  Crossover  : uniform crossover on the list of station indices
-  Mutation   : random re-position of a randomly chosen station
-  Elitism    : top-k individuals always survive unchanged
-"""
-
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
 
-# ---------------------------------------------------------------------------
 # Type aliases
-# ---------------------------------------------------------------------------
 Station  = Tuple[int, int]          # (row, col)
 Chromosome = List[Station]
 
 
-# ---------------------------------------------------------------------------
 # Configuration dataclass
-# ---------------------------------------------------------------------------
 @dataclass
 class GAConfig:
     n_stations:      int   = 10     # number of EV stations to place
@@ -50,20 +21,19 @@ class GAConfig:
     seed:            int | None = 42
 
 
-# ---------------------------------------------------------------------------
 # Distance-based coverage kernel
-# ---------------------------------------------------------------------------
+
+# Return a (grid_size, grid_size) float array where each cell value is
+# the maximum coverage contribution from any station:
+
+# coverage[r,c] = max_i exp( -||cell - station_i||² / (2·scale²) )
+
 def _build_coverage_map(
     stations: Chromosome,
     grid_size: int,
     scale: float,
 ) -> np.ndarray:
-    """
-    Return a (grid_size, grid_size) float array where each cell value is
-    the maximum coverage contribution from any station:
 
-        coverage[r,c] = max_i exp( -||cell - station_i||² / (2·scale²) )
-    """
     rows = np.arange(grid_size)
     cols = np.arange(grid_size)
     R, C = np.meshgrid(rows, cols, indexing="ij")  # (G, G)
@@ -76,56 +46,62 @@ def _build_coverage_map(
     return coverage
 
 
-# ---------------------------------------------------------------------------
 # Fitness evaluation
-# ---------------------------------------------------------------------------
 def evaluate_fitness(
     chromosome: Chromosome,
     density: np.ndarray,
     scale: float,
 ) -> float:
-    """Higher is better."""
+
     grid_size = density.shape[0]
     coverage  = _build_coverage_map(chromosome, grid_size, scale)
-    return float(np.sum(density * coverage))
+
+    #  MAIN TERM: weighted population coverage 
+    population_score = np.sum((density ** 1.5) * coverage)
+
+    #  NEW: penalty for spreading too far 
+    penalty = 0.0
+    for i in range(len(chromosome)):
+        for j in range(i + 1, len(chromosome)):
+            r1, c1 = chromosome[i]
+            r2, c2 = chromosome[j]
+            dist = np.sqrt((r1 - r2)**2 + (c1 - c2)**2)
+            penalty += dist
+
+    penalty = penalty / (len(chromosome) + 1)
+
+    # --- FINAL SCORE ---
+    return float(population_score - 0.1 * penalty)
 
 
-# ---------------------------------------------------------------------------
 # Chromosome initialisation
-# ---------------------------------------------------------------------------
 def random_chromosome(n_stations: int, grid_size: int, rng: np.random.Generator) -> Chromosome:
     rows = rng.integers(0, grid_size, size=n_stations)
     cols = rng.integers(0, grid_size, size=n_stations)
     return list(zip(rows.tolist(), cols.tolist()))
 
 
-# ---------------------------------------------------------------------------
 # Selection
-# ---------------------------------------------------------------------------
 def tournament_select(
     population: List[Chromosome],
     fitnesses:  List[float],
     rng:        np.random.Generator,
     k:          int,
 ) -> Chromosome:
-    """Return a deep copy of the winner of a k-way tournament."""
+    # Return a deep copy of the winner of a k-way tournament.
     indices  = rng.integers(0, len(population), size=k).tolist()
     best_idx = max(indices, key=lambda i: fitnesses[i])
     return list(population[best_idx])  # shallow copy of list of tuples
 
 
-# ---------------------------------------------------------------------------
 # Crossover
-# ---------------------------------------------------------------------------
 def uniform_crossover(
     parent_a: Chromosome,
     parent_b: Chromosome,
     rng:      np.random.Generator,
 ) -> Chromosome:
-    """
-    Uniform crossover: each station position is taken from either parent
-    with equal probability.
-    """
+
+    # each station position is taken from either parent with equal probability.
     n = len(parent_a)
     mask = rng.integers(0, 2, size=n, dtype=bool)
     child: Chromosome = [
@@ -135,18 +111,15 @@ def uniform_crossover(
     return child
 
 
-# ---------------------------------------------------------------------------
 # Mutation
-# ---------------------------------------------------------------------------
 def mutate(
     chromosome: Chromosome,
     mutation_rate: float,
     grid_size:     int,
     rng:           np.random.Generator,
 ) -> Chromosome:
-    """
-    Each station is independently re-randomised with probability mutation_rate.
-    """
+    # Stations is independently re-randomised with probability mutation_rate.
+
     mutated: Chromosome = []
     for (r, c) in chromosome:
         if rng.random() < mutation_rate:
@@ -156,9 +129,7 @@ def mutate(
     return mutated
 
 
-# ---------------------------------------------------------------------------
 # Main GA runner
-# ---------------------------------------------------------------------------
 @dataclass
 class GAResult:
     best_chromosome: Chromosome
@@ -171,24 +142,12 @@ def run_genetic_algorithm(
     config:  GAConfig,
     verbose: bool = True,
 ) -> GAResult:
-    """
-    Run the genetic algorithm and return the best chromosome found.
 
-    Parameters
-    ----------
-    density : normalised (G×G) density matrix (values in [0,1])
-    config  : GAConfig instance
-    verbose : print per-generation progress
-
-    Returns
-    -------
-    GAResult with the best chromosome and fitness history
-    """
     rng       = np.random.default_rng(config.seed)
     grid_size = density.shape[0]
     n_elite   = max(1, int(config.elite_fraction * config.population_size))
 
-    # ---- initialise random population ----
+    # initialise random population 
     population: List[Chromosome] = [
         random_chromosome(config.n_stations, grid_size, rng)
         for _ in range(config.population_size)
@@ -200,13 +159,13 @@ def run_genetic_algorithm(
 
     for gen in range(config.n_generations):
 
-        # ---- evaluate ----
+        #  evaluate 
         fitnesses: List[float] = [
             evaluate_fitness(ch, density, config.coverage_scale)
             for ch in population
         ]
 
-        # ---- track global best ----
+        # track global best 
         gen_best_idx     = int(np.argmax(fitnesses))
         gen_best_fitness = fitnesses[gen_best_idx]
         if gen_best_fitness > best_fitness:
@@ -220,11 +179,11 @@ def run_genetic_algorithm(
                   f"Best fitness: {best_fitness:.4f}  |  "
                   f"Gen best: {gen_best_fitness:.4f}")
 
-        # ---- elitism: keep top-n unchanged ----
+        # seletion: top-n  
         sorted_indices = sorted(range(len(fitnesses)), key=lambda i: fitnesses[i], reverse=True)
         elites: List[Chromosome] = [list(population[i]) for i in sorted_indices[:n_elite]]
 
-        # ---- breed next generation ----
+        # breed next generation 
         next_pop: List[Chromosome] = elites[:]
         while len(next_pop) < config.population_size:
             p1 = tournament_select(population, fitnesses, rng, config.tournament_size)
