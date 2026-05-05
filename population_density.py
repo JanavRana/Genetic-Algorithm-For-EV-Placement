@@ -1,201 +1,85 @@
-"""
-population_density.py
----------------------
-Generates smooth, realistic synthetic population density surfaces
-for a given geographic bounding box. Uses multi-center Gaussian
-mixture models + scipy smoothing to eliminate circular artifacts.
-
-Author: Generated for EV Charging Station Optimization Project
-"""
-
 import numpy as np
 from scipy.ndimage import gaussian_filter
-from scipy.interpolate import RectBivariateSpline
-from dataclasses import dataclass, field
-from typing import List, Tuple, Optional
 
+"""
+Generate a 2-D population-density grid.
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
+Parameters
 
-@dataclass
-class PopulationCenter:
-    """
-    Represents one urban density hotspot.
+bbox        : (south, north, west, east) in degrees
+grid_size   : number of cells along each axis
+n_hotspots  : number of urban density clusters to place
+seed        : random seed for reproducibility (None = fully random)
 
-    Attributes
-    ----------
-    lat, lon   : Geographic coordinates of the center
-    weight     : Relative population intensity (0–1 scale, will be normalized)
-    spread_lat : Std-dev spread in the latitude direction (degrees)
-    spread_lon : Std-dev spread in the longitude direction (degrees)
-    """
-    lat: float
-    lon: float
-    weight: float = 1.0
-    spread_lat: float = 0.015   # ~1.5 km at India latitudes
-    spread_lon: float = 0.018
+Returns
 
+density : (grid_size, grid_size) float array, values in [0, 1]
+"""
+def generate_density_matrix(
+    bbox: tuple[float, float, float, float],
+    grid_size: int = 200,
+    n_hotspots: int = 18,
+    seed: int | None = None,
+) -> np.ndarray:
 
-@dataclass
-class DensityConfig:
-    """
-    Hyper-parameters controlling grid resolution and smoothing.
+    rng = np.random.default_rng(seed)
 
-    Attributes
-    ----------
-    grid_resolution : Number of grid cells along each axis (higher → sharper)
-    sigma_smooth    : Gaussian smoothing radius (in grid cells).
-                      Larger values remove blob artifacts at the cost of detail.
-    noise_scale     : Fraction of max density added as structured noise (realism)
-    noise_seed      : Random seed for reproducibility
-    """
-    grid_resolution: int = 400
-    sigma_smooth: float = 18.0
-    noise_scale: float = 0.08
-    noise_seed: int = 42
+    south, north, west, east = bbox
+    density = np.zeros((grid_size, grid_size), dtype=np.float64)
 
+    #  coordinate grids (fractional position 0‥1) 
+    yi = np.linspace(0.0, 1.0, grid_size)   # latitude axis (rows)
+    xi = np.linspace(0.0, 1.0, grid_size)   # longitude axis (cols)
+    yy, xx = np.meshgrid(yi, xi, indexing="ij")  # shape (grid_size, grid_size)
 
-# ---------------------------------------------------------------------------
-# Core density generator
-# ---------------------------------------------------------------------------
+    #  scatter hotspots across the whole bounding box 
+    for _ in range(n_hotspots):
+        # random centre – uniform across the grid (no centre bias)
+        cy = rng.uniform(0.05, 0.95)
+        cx = rng.uniform(0.05, 0.95)
 
-class PopulationDensityGenerator:
-    """
-    Builds a smooth 2-D population density surface from a list of
-    PopulationCenter objects over a geographic bounding box.
+        # random spread – mix of tight (commercial) and wide (residential) zones
+        sy = rng.uniform(0.04, 0.18)
+        sx = rng.uniform(0.04, 0.18)
 
-    Usage
-    -----
-    >>> gen = PopulationDensityGenerator(bbox, centers, config)
-    >>> density = gen.generate()          # np.ndarray, shape (H, W), values 0–1
-    >>> rgba_img = gen.to_rgba(density)   # np.ndarray uint8 for ImageOverlay
-    """
+        # random peak amplitude
+        amplitude = rng.uniform(2.0, 5.0)
 
-    def __init__(
-        self,
-        bbox: Tuple[float, float, float, float],
-        centers: List[PopulationCenter],
-        config: Optional[DensityConfig] = None,
-    ):
-        """
-        Parameters
-        ----------
-        bbox    : (south, west, north, east) in decimal degrees
-        centers : List of PopulationCenter objects
-        config  : DensityConfig (uses defaults if None)
-        """
-        self.south, self.west, self.north, self.east = bbox
-        self.centers = centers
-        self.cfg = config or DensityConfig()
+        # anisotropic Gaussian: different spread in each direction
+        blob = amplitude * np.exp(
+            -(((yy - cy) ** 2) / (2 * sy ** 2) + ((xx - cx) ** 2) / (2 * sx ** 2))
+        )
+        density += blob
 
-        # Build coordinate grids
-        self.lats = np.linspace(self.south, self.north, self.cfg.grid_resolution)
-        self.lons = np.linspace(self.west,  self.east,  self.cfg.grid_resolution)
-        self.LON, self.LAT = np.meshgrid(self.lons, self.lats)
+    #  low-level structured noise (perlin-like via filtered random) 
+    noise_raw = rng.random((grid_size, grid_size))
+    noise_smooth = gaussian_filter(noise_raw, sigma=grid_size * 0.04)
+    noise_smooth /= noise_smooth.max() + 1e-9
+    density += 0.15 * noise_smooth  # subtle texture layer
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # final smoothing to remove any remaining hard edges 
+    density = gaussian_filter(density, sigma=grid_size * 0.025)
 
-    def generate(self) -> np.ndarray:
-        """
-        Returns a 2-D float array (values 0–1) representing normalized
-        population density. Rows = latitude (south→north), cols = longitude.
-        """
-        surface = self._gaussian_mixture()
-        surface = self._add_structured_noise(surface)
-        surface = self._smooth(surface)
-        surface = self._normalize(surface)
-        return surface
+    #  normalise to [0, 1] 
+    density -= density.min()
+    density /= density.max() + 1e-9
 
-    def to_rgba(
-        self,
-        density: np.ndarray,
-        colormap_name: str = "YlOrRd",
-        alpha_max: float = 0.75,
-        threshold: float = 0.05,
-    ) -> np.ndarray:
-        """
-        Convert a normalized density array → RGBA uint8 image suitable
-        for folium.ImageOverlay.
+    return density
 
-        Parameters
-        ----------
-        density        : Output of generate()
-        colormap_name  : Any matplotlib colormap name
-        alpha_max      : Maximum opacity (0–1). Keeps map visible beneath.
-        threshold      : Density below this value becomes fully transparent.
-        """
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import Normalize
+"""
+Convert a (row, col) grid index back to (latitude, longitude).
 
-        cmap = plt.get_cmap(colormap_name)
-        norm = Normalize(vmin=0, vmax=1)
+Row 0 → south edge, row grid_size-1 → north edge
+Col 0 → west  edge, col grid_size-1 → east  edge
+"""
+def density_to_latlon(
+    row: int,
+    col: int,
+    bbox: tuple[float, float, float, float],
+    grid_size: int,
+) -> tuple[float, float]:
 
-        # Apply colormap → (H, W, 4) float32 in [0,1]
-        rgba = cmap(norm(density)).astype(np.float32)
-
-        # Build alpha channel: proportional to density, hard cutoff at threshold
-        alpha = np.where(density < threshold, 0.0, density * alpha_max)
-        # Soft edges: blend the alpha so there's no sharp boundary ring
-        alpha = gaussian_filter(alpha, sigma=self.cfg.sigma_smooth * 0.5)
-        rgba[:, :, 3] = np.clip(alpha, 0, alpha_max)
-
-        # Flip vertically: ImageOverlay expects north at row-0
-        rgba = np.flipud(rgba)
-
-        return (rgba * 255).astype(np.uint8)
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _gaussian_mixture(self) -> np.ndarray:
-        """Sum weighted, anisotropic Gaussians for each population center."""
-        surface = np.zeros_like(self.LAT)
-        total_weight = sum(c.weight for c in self.centers)
-
-        for center in self.centers:
-            w = center.weight / total_weight
-            dlat = (self.LAT - center.lat) / center.spread_lat
-            dlon = (self.LON - center.lon) / center.spread_lon
-            # Anisotropic Gaussian (different sigma per axis → no perfect circles)
-            surface += w * np.exp(-0.5 * (dlat**2 + dlon**2))
-
-        return surface
-
-    def _add_structured_noise(self, surface: np.ndarray) -> np.ndarray:
-        """
-        Add low-frequency Perlin-like noise to break up uniform gradients.
-        Uses multiple octaves of smoothed random noise for realism.
-        """
-        rng = np.random.default_rng(self.cfg.noise_seed)
-        noise = np.zeros_like(surface)
-        n = self.cfg.grid_resolution
-
-        # Three octaves: coarse, medium, fine
-        for sigma, amplitude in [(n * 0.15, 1.0), (n * 0.06, 0.4), (n * 0.02, 0.15)]:
-            raw = rng.standard_normal((n, n))
-            octave = gaussian_filter(raw, sigma=sigma)
-            octave = (octave - octave.min()) / (octave.max() - octave.min())
-            noise += amplitude * octave
-
-        noise = (noise - noise.min()) / (noise.max() - noise.min())
-        return surface + self.cfg.noise_scale * noise * surface  # modulate by density
-
-    def _smooth(self, surface: np.ndarray) -> np.ndarray:
-        """
-        Apply Gaussian smoothing to eliminate circular blob artifacts.
-        This is the key step: a single large sigma blurs away the
-        per-center rings while preserving the overall gradient shape.
-        """
-        return gaussian_filter(surface, sigma=self.cfg.sigma_smooth)
-
-    @staticmethod
-    def _normalize(surface: np.ndarray) -> np.ndarray:
-        mn, mx = surface.min(), surface.max()
-        if mx == mn:
-            return np.zeros_like(surface)
-        return (surface - mn) / (mx - mn)
+    south, north, west, east = bbox
+    lat = south + (row / (grid_size - 1)) * (north - south)
+    lon = west  + (col / (grid_size - 1)) * (east  - west)
+    return lat, lon
