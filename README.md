@@ -1,4 +1,4 @@
-# ⚡ EV Charging Station Optimiser — Genetic Algorithm + OpenStreetMap
+# EV Charging Station Optimiser
 
 Optimal placement of EV charging stations in Surat, India using a
 **Genetic Algorithm** with real city road data and interactive map visualisation.
@@ -38,7 +38,7 @@ python main.py
 You will be prompted:
 
 
-⚡  How many EV charging stations do you want? (e.g. 10): 12
+How many EV charging stations do you want? (e.g. 10): 12
 
 
 The script will then:
